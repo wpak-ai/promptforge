@@ -34,6 +34,7 @@ promptforge-model-client = { path = "crates/promptforge-model-client", version =
 promptforge-parser = { path = "crates/promptforge-parser", version = "0.2.0" }
 shared-progress = { path = "crates/shared-progress", version = "0.2.0" }
 gateway-stt = { path = "crates/gateway-stt", version = "0.2.0" }
+gateway-tts = { path = "crates/gateway-tts", version = "0.2.0" }
 promptforge-store = { path = "crates/promptforge-store", version = "0.2.0" }
 promptforge-webfetch = { path = "crates/promptforge-webfetch", version = "0.2.0" }
 promptforge-tool-picker = { path = "crates/promptforge-tool-picker", version = "0.2.0" }
@@ -61,6 +62,10 @@ percent-encoding = "2"
 ipnet = "2"
 dunce = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
+# The cheaply-cloneable byte buffer reqwest's `bytes_stream` yields; named
+# directly because reqwest does not re-export it, and the speech relay's
+# public stream type is written in terms of it.
+bytes = "1"
 # default-features off: the `sync` module (CancellationToken) is ungated in
 # tokio-util 0.7, so no features are required for it.
 tokio-util = { version = "0.7", default-features = false }

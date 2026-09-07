@@ -324,6 +324,7 @@ impl Config {
             validate_capabilities(
                 "model",
                 &model.name,
+                model.kind,
                 model.context,
                 model.thinking,
                 &model.capabilities,
@@ -346,6 +347,16 @@ impl Config {
             if !model_names.insert(local_model.name.as_str()) {
                 return Err(ConfigError::Validation(format!(
                     "duplicate model name {}",
+                    local_model.name
+                )));
+            }
+            // Rejected here rather than at launch: `launch_options` maps a
+            // kind to a `llama-server` serve mode, and there is none for
+            // speech, so a local speech model could only ever start as the
+            // wrong kind of child.
+            if local_model.kind == ModelKind::Speech {
+                return Err(ConfigError::Validation(format!(
+                    "local_model {} has kind = \"speech\", which this release cannot serve locally (local speech synthesis is phase 2); declare it as a remote [[model]] on an OpenAI-compatible endpoint instead",
                     local_model.name
                 )));
             }
@@ -421,6 +432,7 @@ impl Config {
             validate_capabilities(
                 "local_model",
                 &local_model.name,
+                local_model.kind,
                 local_model.context,
                 local_model.thinking,
                 &local_model.capabilities,
@@ -667,14 +679,36 @@ impl Config {
 ///
 /// `default_effort` requires a non-empty `effort_levels` and must name a
 /// listed level; the effort knobs are meaningless on a model that never
-/// thinks; and `max_output` must fit the context window.
+/// thinks; `max_output` must fit the context window; and `voices` is
+/// speech-only, with entries that are non-blank and distinct so a typo can
+/// never produce a voice no request can name.
 fn validate_capabilities(
     label: &str,
     name: &str,
+    kind: ModelKind,
     context: u32,
     thinking: ThinkingMode,
     capabilities: &Capabilities,
 ) -> Result<(), ConfigError> {
+    if kind == ModelKind::Speech {
+        let mut seen = HashSet::new();
+        for voice in &capabilities.voices {
+            if voice.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "{label} {name} voices must not contain an empty entry"
+                )));
+            }
+            if !seen.insert(voice.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "{label} {name} lists duplicate voice {voice:?}"
+                )));
+            }
+        }
+    } else if !capabilities.voices.is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "{kind} {label} {name} must not set voices (speech-only)"
+        )));
+    }
     if let Some(default_effort) = &capabilities.default_effort {
         if capabilities.effort_levels.is_empty() {
             return Err(ConfigError::Validation(format!(

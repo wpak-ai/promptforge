@@ -1555,7 +1555,7 @@ context = 4096
 
 #[test]
 fn rejects_embedding_model_with_thinking() {
-    for kind in ["embedding", "classifier"] {
+    for kind in ["embedding", "classifier", "speech"] {
         let toml = catalog_with_model_kind(kind, "thinking = \"always\"");
         match Config::parse_toml(&toml) {
             Err(ConfigError::Validation(message)) => {
@@ -1575,7 +1575,7 @@ fn rejects_embedding_model_with_thinking() {
 
 #[test]
 fn rejects_classifier_model_with_default_max_tokens() {
-    for kind in ["embedding", "classifier"] {
+    for kind in ["embedding", "classifier", "speech"] {
         let toml = catalog_with_model_kind(kind, "default_max_tokens = 1024");
         match Config::parse_toml(&toml) {
             Err(ConfigError::Validation(message)) => {
@@ -1662,6 +1662,91 @@ fn accepts_chat_models_with_chat_only_fields() {
 }
 
 #[test]
+fn accepts_speech_model_with_voices() {
+    let toml = catalog_with_model_kind("speech", "voices = [\"tara\", \"leo\"]");
+    let config = Config::from_toml_str(&toml).unwrap();
+    assert_eq!(config.models()[0].capabilities().voices(), ["tara", "leo"]);
+}
+
+#[test]
+fn accepts_speech_model_without_voices() {
+    // An empty list is "unset": the model names no voices and the backend
+    // chooses, so the route forwards whatever voice the caller asked for.
+    let toml = catalog_with_model_kind("speech", "");
+    let config = Config::from_toml_str(&toml).unwrap();
+    assert!(config.models()[0].capabilities().voices().is_empty());
+}
+
+#[test]
+fn rejects_voices_on_non_speech_kinds() {
+    // `voices` is speech-only on every model type, the same discipline the
+    // chat-only fields get for non-chat kinds.
+    for kind in ["chat", "embedding", "classifier"] {
+        let toml = catalog_with_model_kind(kind, "voices = [\"tara\"]");
+        match Config::parse_toml(&toml) {
+            Err(ConfigError::Validation(message)) => {
+                assert!(
+                    message.contains("model m") && message.contains("voices"),
+                    "expected the error to name the model and the field: {message}"
+                );
+            }
+            other => panic!("expected a validation error for kind {kind}, got {other:?}"),
+        }
+        let toml = catalog_with_local_model_kind(kind, "voices = [\"tara\"]");
+        assert!(
+            matches!(Config::parse_toml(&toml), Err(ConfigError::Validation(_))),
+            "expected local_model voices to be rejected for kind {kind}"
+        );
+    }
+}
+
+#[test]
+fn rejects_empty_and_duplicate_voices() {
+    // A blank entry names no voice a request could ever match, and a
+    // duplicate hides a typo behind a valid-looking list.
+    let toml = catalog_with_model_kind("speech", "voices = [\"tara\", \"  \"]");
+    match Config::parse_toml(&toml) {
+        Err(ConfigError::Validation(message)) => assert!(
+            message.contains("empty entry"),
+            "expected the error to name the empty entry: {message}"
+        ),
+        other => panic!("expected a validation error, got {other:?}"),
+    }
+    let toml = catalog_with_model_kind("speech", "voices = [\"tara\", \"tara\"]");
+    match Config::parse_toml(&toml) {
+        Err(ConfigError::Validation(message)) => assert!(
+            message.contains("duplicate voice"),
+            "expected the error to name the duplicate: {message}"
+        ),
+        other => panic!("expected a validation error, got {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_local_speech_model_naming_phase_two() {
+    // There is no `llama-server` serve mode for speech, so a local speech
+    // model is refused at load rather than launched as the wrong child.
+    let toml = catalog_with_local_model_kind("speech", "");
+    match Config::parse_toml(&toml) {
+        Err(ConfigError::Validation(message)) => {
+            assert!(
+                message.contains("local_model q"),
+                "expected the error to name the model: {message}"
+            );
+            assert!(
+                message.contains("phase 2"),
+                "expected the error to name the phase: {message}"
+            );
+            assert!(
+                message.contains("[[model]]"),
+                "expected the error to name the remote alternative: {message}"
+            );
+        }
+        other => panic!("expected a validation error, got {other:?}"),
+    }
+}
+
+#[test]
 fn parses_model_capabilities() {
     let toml = catalog_with_model_kind(
         "chat",
@@ -1697,6 +1782,7 @@ fn capabilities_default_to_absent() {
     assert!(capabilities.effort_levels().is_empty());
     assert_eq!(capabilities.default_effort(), None);
     assert!(!capabilities.adaptive_thinking());
+    assert!(capabilities.voices().is_empty());
 }
 
 #[test]
@@ -1781,7 +1867,7 @@ fn rejects_max_output_exceeding_context() {
 fn rejects_nonchat_model_with_capability_effort_fields() {
     // The effort knobs and adaptive_thinking are chat-only, same as
     // `thinking` itself.
-    for kind in ["embedding", "classifier"] {
+    for kind in ["embedding", "classifier", "speech"] {
         for (field, extra) in [
             ("effort_levels", "effort_levels = [\"low\"]"),
             (

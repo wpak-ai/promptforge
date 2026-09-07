@@ -339,6 +339,15 @@ context = 8192
 upstream = "u"
 endpoints = ["e"]
 
+[[model]]
+name = "speak"
+kind = "speech"
+description = "prose"
+context = 8192
+upstream = "u"
+endpoints = ["e"]
+voices = ["tara", "leo"]
+
 [[local_model]]
 name = "rerank"
 kind = "classifier"
@@ -348,6 +357,8 @@ context = 4096
 "#;
     let config = Config::from_toml_str(toml).unwrap();
     assert_eq!(config.models[0].kind, ModelKind::Embedding);
+    assert_eq!(config.models[1].kind, ModelKind::Speech);
+    assert_eq!(config.models[1].capabilities.voices(), ["tara", "leo"]);
     assert_eq!(config.local_models[0].kind, ModelKind::Classifier);
 }
 

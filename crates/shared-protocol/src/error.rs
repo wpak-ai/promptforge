@@ -123,6 +123,20 @@ impl ProtocolError {
                 "server_error",
                 "upstream_protocol",
             ),
+            // Rate limiting and capacity are the two upstream statuses a
+            // caller acts on differently from a bad request or a broken
+            // backend, so each keeps its own status and code rather than
+            // folding into the generic buckets below.
+            ProtocolError::UpstreamStatus { status: 429, .. } => (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "upstream_rate_limited",
+            ),
+            ProtocolError::UpstreamStatus { status: 503, .. } => (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "upstream_unavailable",
+            ),
             ProtocolError::UpstreamStatus { status, .. } => {
                 let code = reqwest::StatusCode::from_u16(*status)
                     .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
@@ -220,6 +234,24 @@ mod tests {
                 ProtocolError::upstream_status(429, "rate limited".to_owned()),
                 (
                     reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    "upstream_rate_limited",
+                ),
+            ),
+            (
+                ProtocolError::upstream_status(503, "busy".to_owned()),
+                (
+                    reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    "server_error",
+                    "upstream_unavailable",
+                ),
+            ),
+            (
+                // Every other client error keeps the generic code, so a rate
+                // limit stays distinguishable from a plain bad request.
+                ProtocolError::upstream_status(404, "no such model".to_owned()),
+                (
+                    reqwest::StatusCode::NOT_FOUND,
                     "invalid_request_error",
                     "upstream_client_error",
                 ),
@@ -257,9 +289,9 @@ mod tests {
 
     #[test]
     fn envelope_carries_message_type_and_code() {
-        let error = ProtocolError::upstream_status(503, "busy".to_owned());
+        let error = ProtocolError::upstream_status(500, "exploded".to_owned());
         let envelope = error.envelope();
-        assert_eq!(envelope["error"]["message"], "upstream returned 503");
+        assert_eq!(envelope["error"]["message"], "upstream returned 500");
         assert_eq!(envelope["error"]["type"], "server_error");
         assert_eq!(envelope["error"]["code"], "upstream_error");
     }

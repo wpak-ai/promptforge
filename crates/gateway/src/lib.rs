@@ -10,7 +10,11 @@
 //! bearer auth, model routing, and a typed SSE relay for `stream: true`, an
 //! embeddings passthrough at
 //! `POST /v1/embeddings` for `kind = "embedding"` models, a rerank
-//! passthrough at `POST /v1/rerank` for `kind = "classifier"` models, shared
+//! passthrough at `POST /v1/rerank` for `kind = "classifier"` models, an
+//! OpenAI-compatible `POST /v1/audio/speech` for `kind = "speech"` models
+//! relaying the backend's audio bytes with the dominion permit held for the
+//! stream, a `GET /v1/audio/voices` catalog of the voices those models
+//! offer, shared
 //! concurrency pools with bounded, fair waiting queues (`[[dominion]]`),
 //! gateway-owned local generative inference via a managed `llama-server`
 //! subprocess (`[[local_model]]`), named profile checklists from one loaded
@@ -130,7 +134,6 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::body::Body;
-#[cfg(feature = "stt")]
 use axum::extract::FromRequest;
 use axum::extract::State;
 use axum::http::HeaderValue;
@@ -150,7 +153,7 @@ use crate::local::LocalRuntime;
 use crate::routing::Routing;
 use crate::wire::{
     ChatRequest, EmbeddingRequest, EmbeddingResponse, ModelInfo, ModelsResponse, RerankRequest,
-    RerankResponse,
+    RerankResponse, SpeechRequest,
 };
 use gateway_config::ModelKind;
 #[cfg(feature = "web-search")]
@@ -466,6 +469,8 @@ pub(crate) fn build_router(state: AppState, bound: Option<std::net::SocketAddr>)
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/rerank", post(rerank))
+        .route("/v1/audio/speech", post(audio_speech))
+        .route("/v1/audio/voices", get(audio_voices))
         .route("/v1/models", get(list_models))
         .route("/health", get(health))
         .route("/admin/profiles", get(admin_list_profiles))
@@ -919,6 +924,96 @@ async fn rerank(
     Ok(Json(response))
 }
 
+/// What a relayed speech stream keeps alive: the dominion permit and the
+/// in-flight registration, both released when the response body ends.
+#[derive(Debug)]
+struct SpeechHold {
+    /// Held, never read: dropping it returns the concurrency slot.
+    _permit: crate::queue::Permit,
+    in_flight: drain::InFlightGuard,
+}
+
+impl gateway_tts::StreamHold for SpeechHold {
+    fn cancelled(&self) -> impl std::future::Future<Output = ()> + Send {
+        self.in_flight.cancelled()
+    }
+}
+
+/// The speech route to a backend: the same auth, routing, kind guard, and
+/// dominion queue admission as chat, for `kind = "speech"` models, answering
+/// with the backend's audio bytes.
+///
+/// Authentication runs before body extraction, so an unauthorized caller
+/// cannot make the gateway parse a request body. The voice is checked before
+/// queue admission: a request naming a voice the model does not offer is
+/// already refused, so letting it take a concurrency slot first would only
+/// delay other callers.
+///
+/// The permit and the in-flight guard are held for the stream's whole
+/// lifetime, exactly as the chat relay holds them, so a profile switch drains
+/// a synthesis in progress and a client disconnect releases the slot.
+async fn audio_speech(
+    State(state): State<AppState>,
+    caller: Caller,
+    request: axum::extract::Request,
+) -> Result<Response, GatewayError> {
+    check_auth(&state, &caller).await?;
+    let Json(request) = Json::<SpeechRequest>::from_request(request, &())
+        .await
+        .map_err(|rejection| GatewayError::MalformedRequest(rejection.body_text()))?;
+    request
+        .validate()
+        .map_err(|reason| GatewayError::MalformedRequest(reason.to_owned()))?;
+    let in_flight = state.begin_inference().await;
+    let model = resolve_routed_model(&state, &request.model).await?;
+    crate::routing::require_kind(&model, ModelKind::Speech)?;
+    // `validate` already refused the object form, so a name is present.
+    let voice = request.voice.name().unwrap_or_default();
+    gateway_tts::check_voice(&model.name, voice, model.capabilities.voices())?;
+    let client_id = crate::queue::ClientId::from_header(
+        caller
+            .get(CLIENT_HEADER)
+            .and_then(|value| value.to_str().ok()),
+    );
+    let permit = tokio::select! {
+        result = model.endpoint.queue.admit(client_id.as_str()) => result?,
+        () = in_flight.cancelled() => return Err(GatewayError::RequestCancelled),
+    };
+    // A failure here is before the audio response starts, so it is consumed
+    // as a normal JSON error, never a clip that dies mid-flight.
+    let audio = tokio::select! {
+        result = model.endpoint.upstream.send_speech(request, &model.upstream_name) => result?,
+        () = in_flight.cancelled() => return Err(GatewayError::RequestCancelled),
+    };
+    Ok(gateway_tts::relay_audio(
+        audio,
+        SpeechHold {
+            _permit: permit,
+            in_flight,
+        },
+    ))
+}
+
+/// The voice catalog: every voice the active profile's speech models offer.
+///
+/// OpenAI has no such endpoint, but the OpenAI-compatible ecosystem
+/// converged on this route and clients probe for it, so serving it costs one
+/// union and buys off-the-shelf compatibility.
+async fn audio_voices(
+    State(state): State<AppState>,
+    caller: Caller,
+) -> Result<Json<gateway_tts::VoicesResponse>, GatewayError> {
+    check_auth(&state, &caller).await?;
+    let live = state.live.read().await;
+    Ok(Json(gateway_tts::voices_response(
+        live.routing
+            .models()
+            .iter()
+            .filter(|model| model.kind == ModelKind::Speech)
+            .flat_map(|model| model.capabilities.voices()),
+    )))
+}
+
 /// Bearer-authed catalog of configured models for host bind.
 async fn list_models(
     State(state): State<AppState>,
@@ -999,6 +1094,37 @@ fn endpoint_status(
     }
 }
 
+/// One readiness entry per capability endpoint the gateway can serve, for
+/// `GET /admin/status`.
+///
+/// An endpoint is ready when the live routing table serves its kind, and
+/// provisioning when the catalog names a model for it that a running command
+/// has not loaded yet. Transcription is not here: its models live outside the
+/// routing table, so its caller appends it from its own runtime.
+fn capability_endpoints(live: &LiveState, command_active: bool) -> Vec<EndpointStatus> {
+    let configured = |kind: ModelKind| {
+        live.config
+            .models()
+            .iter()
+            .any(|model| model.kind() == kind)
+            || live
+                .config
+                .local_models()
+                .iter()
+                .any(|model| model.kind() == kind)
+    };
+    let routed = |kind: ModelKind| live.routing.models().iter().any(|model| model.kind == kind);
+    let of_kind = |path, name, kind| {
+        endpoint_status(path, name, configured(kind), routed(kind), command_active)
+    };
+    vec![
+        of_kind("/v1/chat/completions", "Chat completions", ModelKind::Chat),
+        of_kind("/v1/embeddings", "Embeddings", ModelKind::Embedding),
+        of_kind("/v1/rerank", "Rerank", ModelKind::Classifier),
+        of_kind("/v1/audio/speech", "Speech", ModelKind::Speech),
+    ]
+}
+
 /// An `Instant` as Unix epoch seconds for the status wire shape. The
 /// conversion goes through the elapsed duration, so a clock that jumped
 /// backward clamps to now rather than underflowing.
@@ -1037,42 +1163,7 @@ async fn admin_status(
     #[cfg(not(feature = "local"))]
     let local_children = 0;
     let (_, vram_gb) = live.model_status();
-    let command_active = active.is_some();
-    let configured = |kind: ModelKind| {
-        live.config
-            .models()
-            .iter()
-            .any(|model| model.kind() == kind)
-            || live
-                .config
-                .local_models()
-                .iter()
-                .any(|model| model.kind() == kind)
-    };
-    let routed = |kind: ModelKind| live.routing.models().iter().any(|model| model.kind == kind);
-    let endpoints = vec![
-        endpoint_status(
-            "/v1/chat/completions",
-            "Chat completions",
-            configured(ModelKind::Chat),
-            routed(ModelKind::Chat),
-            command_active,
-        ),
-        endpoint_status(
-            "/v1/embeddings",
-            "Embeddings",
-            configured(ModelKind::Embedding),
-            routed(ModelKind::Embedding),
-            command_active,
-        ),
-        endpoint_status(
-            "/v1/rerank",
-            "Rerank",
-            configured(ModelKind::Classifier),
-            routed(ModelKind::Classifier),
-            command_active,
-        ),
-    ];
+    let endpoints = capability_endpoints(&live, active.is_some());
     #[cfg(feature = "stt")]
     let endpoints = {
         let mut endpoints = endpoints;
@@ -1081,7 +1172,7 @@ async fn admin_status(
             "Audio transcriptions",
             !live.config.stt_models().is_empty(),
             state.stt_state.is_active(),
-            command_active,
+            active.is_some(),
         ));
         endpoints
     };
@@ -4066,7 +4157,7 @@ mod status_surface_tests {
             chat["provisioning"], false,
             "no command is running, so nothing provisions"
         );
-        for path in ["/v1/embeddings", "/v1/rerank"] {
+        for path in ["/v1/embeddings", "/v1/rerank", "/v1/audio/speech"] {
             let entry = endpoints
                 .iter()
                 .find(|entry| entry["path"] == path)
@@ -4239,5 +4330,141 @@ mod status_surface_tests {
 
         queue.shutdown();
         worker.await.expect("the worker exits on shutdown");
+    }
+}
+
+#[cfg(test)]
+mod speech_route_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use gateway_config::Config;
+    use tower::ServiceExt;
+
+    use crate::build_router;
+    use crate::test_support::app_state;
+
+    /// A gateway serving one speech model whose backend is a closed port:
+    /// every test here is refused before any upstream call.
+    fn state() -> crate::AppState {
+        let config = Config::from_toml_str(
+            "config-version = 2\n\
+             [server]\nbind = \"127.0.0.1:0\"\napi_key = \"test-token\"\n\
+             [[endpoint]]\nid = \"e\"\nprotocol = \"openai\"\n\
+             base_url = \"http://127.0.0.1:9\"\napi_key = \"\"\n\
+             [[model]]\nname = \"orpheus\"\nkind = \"speech\"\n\
+             description = \"a speech model\"\ncontext = 8192\n\
+             upstream = \"backend-orpheus\"\nendpoints = [\"e\"]\n\
+             voices = [\"tara\", \"leo\"]\n",
+        )
+        .expect("config parses");
+        app_state(config, None)
+    }
+
+    async fn speech(body: &str, bearer: Option<&str>) -> axum::response::Response {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header("content-type", "application/json");
+        if let Some(bearer) = bearer {
+            request = request.header("authorization", format!("Bearer {bearer}"));
+        }
+        build_router(state(), None)
+            .oneshot(
+                request
+                    .body(Body::from(body.to_owned()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router answers")
+    }
+
+    async fn envelope(response: axum::response::Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+        serde_json::from_slice(&body).expect("body is JSON")
+    }
+
+    #[tokio::test]
+    async fn speech_checks_bearer_auth_before_body_extraction() {
+        let response = speech("not json at all", None).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "auth refuses the request before its malformed body is parsed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_body_is_the_openai_envelope() {
+        let response = speech("not json at all", Some("test-token")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            envelope(response).await["error"]["code"],
+            "malformed_request"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_model_returns_openai_model_not_found() {
+        let response = speech(
+            r#"{"model":"ghost","input":"hi","voice":"tara"}"#,
+            Some("test-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(envelope(response).await["error"]["code"], "model_not_found");
+    }
+
+    #[tokio::test]
+    async fn an_uncatalogued_voice_is_refused_before_the_backend() {
+        // The backend port is closed, so reaching it would be a 502: a 400
+        // proves the voice check ran first.
+        let response = speech(
+            r#"{"model":"orpheus","input":"hi","voice":"nova"}"#,
+            Some("test-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let envelope = envelope(response).await;
+        assert_eq!(envelope["error"]["code"], "invalid_voice");
+        let message = envelope["error"]["message"].as_str().expect("a message");
+        assert!(
+            message.contains("tara, leo"),
+            "the refusal names the valid voices: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_voices_route_is_bearer_authed_and_lists_the_catalog() {
+        let unauthorized = build_router(state(), None)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/audio/voices")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router answers");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = build_router(state(), None)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/audio/voices")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router answers");
+        assert_eq!(authorized.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(authorized.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+        assert_eq!(
+            &body[..],
+            br#"{"voices":[{"id":"leo","name":"leo"},{"id":"tara","name":"tara"}]}"#
+        );
     }
 }

@@ -36,5 +36,6 @@ mod progress;
 mod queue;
 mod rerank;
 mod sidecar;
+mod speech;
 mod surface;
 mod web_search;

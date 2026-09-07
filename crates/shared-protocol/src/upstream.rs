@@ -6,14 +6,15 @@
 //! behind this same trait, with no change to routing or the request handler.
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use bytes::Bytes;
 use futures_util::stream::BoxStream;
+use futures_util::{StreamExt, TryStreamExt};
 use gateway_config::Secret;
 
 use crate::error::{ProtocolError, ShutdownError};
 use crate::wire::{
     ChatChunk, ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, RerankRequest,
-    RerankResponse,
+    RerankResponse, SpeechRequest,
 };
 
 /// An opened streaming chat completion: the upstream response headers worth
@@ -35,6 +36,30 @@ impl std::fmt::Debug for StreamedChunks {
         f.debug_struct("StreamedChunks")
             .field("content_type", &self.content_type)
             .field("cache_control", &self.cache_control)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An opened audio stream: the media type to answer the caller with, plus
+/// the backend's bytes.
+///
+/// Unlike [`StreamedChunks`], nothing here is re-parsed. Audio frames are
+/// opaque, so the relay above this type forwards bytes as they arrive; the
+/// only decision this type carries is which media type to name.
+pub struct StreamedAudio {
+    /// The media type to answer with: the backend's own `Content-Type` when
+    /// it named one, otherwise the media type of the requested format.
+    pub content_type: String,
+    /// The audio byte stream. A mid-stream transport failure surfaces as an
+    /// `Err` item rather than a silently short clip. Dropping the stream
+    /// drops the upstream response and aborts the connection.
+    pub body: BoxStream<'static, Result<Bytes, ProtocolError>>,
+}
+
+impl std::fmt::Debug for StreamedAudio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamedAudio")
+            .field("content_type", &self.content_type)
             .finish_non_exhaustive()
     }
 }
@@ -128,6 +153,35 @@ pub trait Upstream: Send + Sync {
         Err(ProtocolError::ModelUnavailable(req.model))
     }
 
+    /// Synthesize `req` at the backend, substituting `upstream_model` for the
+    /// caller's model name, and return the audio stream.
+    ///
+    /// The stream is boxed because the trait is used as `Arc<dyn Upstream>`:
+    /// an `impl Stream` return would break object safety. Bytes are
+    /// forwarded unread - audio frames are opaque, so there is nothing to
+    /// validate per item - and a mid-stream transport failure surfaces as an
+    /// `Err` item rather than a silently truncated clip. Dropping the stream
+    /// aborts the upstream connection, which is how a client disconnect
+    /// cancels the synthesis.
+    ///
+    /// The default is [`ProtocolError::ModelUnavailable`]: upstreams without a
+    /// speech implementation decline the workload rather than fabricate a
+    /// response.
+    ///
+    /// # Errors
+    /// Returns [`ProtocolError::UpstreamConnect`] when the connection itself
+    /// fails, [`ProtocolError::UpstreamTransport`] on a mid-flight transport
+    /// failure before the stream starts, [`ProtocolError::UpstreamStatus`] on
+    /// a non-success backend status, and [`ProtocolError::ModelUnavailable`]
+    /// when the upstream cannot synthesize speech at all.
+    async fn send_speech(
+        &self,
+        req: SpeechRequest,
+        _upstream_model: &str,
+    ) -> Result<StreamedAudio, ProtocolError> {
+        Err(ProtocolError::ModelUnavailable(req.model))
+    }
+
     /// Explicitly release any owned resources (for example a child process) and
     /// disable further recovery, surfacing any teardown failure.
     ///
@@ -157,6 +211,11 @@ pub struct OpenAiUpstream {
     /// whole-request timeout covers the body read and would kill any
     /// long-lived SSE stream, so streams never use `http`.
     http_stream: reqwest::Client,
+    /// Idle-bounded client for the speech path. Synthesis streams like SSE,
+    /// so it cannot use `http`, but unlike a chat stream its time to first
+    /// byte is bounded, so silence is a failure worth detecting rather than
+    /// prompt-processing worth waiting out.
+    http_speech: reqwest::Client,
 }
 
 impl OpenAiUpstream {
@@ -168,6 +227,7 @@ impl OpenAiUpstream {
             api_key,
             http: crate::http_util::bounded_client(),
             http_stream: crate::http_util::streaming_client(),
+            http_speech: crate::http_util::speech_client(),
         }
     }
 
@@ -183,7 +243,8 @@ impl OpenAiUpstream {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             http: http.clone(),
-            http_stream: http,
+            http_stream: http.clone(),
+            http_speech: http,
         }
     }
 
@@ -395,6 +456,28 @@ impl Upstream for OpenAiUpstream {
             .await?;
         Ok(sse_chunks(response, requested))
     }
+
+    async fn send_speech(
+        &self,
+        mut req: SpeechRequest,
+        upstream_model: &str,
+    ) -> Result<StreamedAudio, ProtocolError> {
+        upstream_model.clone_into(&mut req.model);
+        // Read before the move: the requested format names the media type to
+        // fall back on when the backend does not name one itself.
+        let fallback = req.response_format.content_type();
+        let response = self.post(&self.http_speech, "audio/speech", &req).await?;
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map_or_else(|| fallback.to_owned(), str::to_owned);
+        let body = response
+            .bytes_stream()
+            .map_err(ProtocolError::upstream_transport)
+            .boxed();
+        Ok(StreamedAudio { content_type, body })
+    }
 }
 
 #[cfg(test)]
@@ -411,12 +494,27 @@ mod tests {
     /// A one-shot mock backend: serves a single canned `(status, body)` and
     /// returns its base URL plus the captured raw request for assertions.
     fn serve_once(status_line: &str, body: &str) -> (String, JoinHandle<String>) {
+        serve_once_with(status_line, Some("application/json"), body.as_bytes())
+    }
+
+    /// [`serve_once`] over arbitrary bytes and an optional `Content-Type`,
+    /// so the audio tests can serve a binary body and omit the header.
+    fn serve_once_with(
+        status_line: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> (String, JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock backend");
         let addr = listener.local_addr().expect("addr");
-        let response = format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        let content_type = content_type
+            .map(|value| format!("Content-Type: {value}\r\n"))
+            .unwrap_or_default();
+        let mut response = format!(
+            "HTTP/1.1 {status_line}\r\n{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
-        );
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
         let handle = thread::spawn(move || -> String {
             let (mut stream, _) = listener.accept().expect("accept");
             // A short read timeout bounds request capture without a sleep: once
@@ -431,7 +529,7 @@ mod tests {
                     Ok(n) => request.extend_from_slice(&buf[..n]),
                 }
             }
-            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(&response);
             let _ = stream.flush();
             String::from_utf8_lossy(&request).into_owned()
         });
@@ -873,6 +971,197 @@ mod tests {
         assert!(
             closed,
             "dropping the stream must abort the upstream connection"
+        );
+    }
+
+    fn speech_request(model: &str) -> crate::wire::SpeechRequest {
+        crate::wire::SpeechRequest {
+            model: model.to_owned(),
+            input: "Hello <laugh> there".to_owned(),
+            voice: crate::wire::SpeechVoice::Name("tara".to_owned()),
+            response_format: crate::wire::SpeechResponseFormat::Wav,
+            speed: None,
+            instructions: None,
+            stream_format: None,
+            rest: Map::new(),
+        }
+    }
+
+    /// Collects an audio body into one buffer, failing on a stream error.
+    async fn collect_audio(mut audio: StreamedAudio) -> Vec<u8> {
+        let mut collected = Vec::new();
+        while let Some(chunk) = audio.body.next().await {
+            collected.extend_from_slice(&chunk.expect("audio chunk"));
+        }
+        collected
+    }
+
+    #[tokio::test]
+    async fn speech_rewrites_caller_model_and_posts_to_audio_speech() {
+        // UP-008: the backend sees the upstream model name and never the
+        // caller's, and the audio bytes come back exactly as sent.
+        let clip: Vec<u8> = (0_u8..64).collect();
+        let (base, handle) = serve_once_with("200 OK", Some("audio/wav"), &clip);
+        let upstream = OpenAiUpstream::new(&base, Secret::new("endpoint-key".to_owned()));
+        let audio = upstream
+            .send_speech(speech_request("caller-model"), "backend-orpheus")
+            .await
+            .expect("send ok");
+        assert_eq!(audio.content_type, "audio/wav");
+        assert_eq!(collect_audio(audio).await, clip, "audio passes through");
+        let sent = handle.join().expect("join");
+        assert!(sent.contains("POST /audio/speech"), "{sent}");
+        assert!(sent.contains("backend-orpheus"), "forwarded body: {sent}");
+        assert!(
+            !sent.contains("caller-model"),
+            "caller model leaked: {sent}"
+        );
+        assert!(
+            sent.to_ascii_lowercase()
+                .contains("authorization: bearer endpoint-key"),
+            "endpoint credential must reach the backend: {sent}"
+        );
+        assert!(
+            sent.contains("<laugh>"),
+            "inline direction tags must reach the backend: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn speech_falls_back_to_the_requested_format_media_type() {
+        // A backend that names no Content-Type still gets a correct one: the
+        // format the caller asked for is what was encoded.
+        let (base, handle) = serve_once_with("200 OK", None, b"RIFF");
+        let upstream = OpenAiUpstream::new(&base, Secret::new(String::new()));
+        let audio = upstream
+            .send_speech(speech_request("m"), "u")
+            .await
+            .expect("send ok");
+        assert_eq!(audio.content_type, "audio/wav");
+        let _ = handle.join();
+    }
+
+    #[tokio::test]
+    async fn speech_non_success_status_is_upstream_status() {
+        // The failure is decided before any body byte is treated as audio,
+        // so an error page never reaches the caller as a corrupt clip.
+        let (base, handle) = serve_once("503 Service Unavailable", "at capacity");
+        let upstream = OpenAiUpstream::new(&base, Secret::new(String::new()));
+        let err = upstream
+            .send_speech(speech_request("m"), "u")
+            .await
+            .expect_err("should fail");
+        match &err {
+            ProtocolError::UpstreamStatus { status, body } => {
+                assert_eq!(*status, 503);
+                assert_eq!(body, "at capacity");
+            }
+            other => panic!("expected UpstreamStatus, got {other:?}"),
+        }
+        // A backend at capacity is distinguishable from a broken one.
+        assert_eq!(err.envelope()["error"]["code"], "upstream_unavailable");
+        let _ = handle.join();
+    }
+
+    #[tokio::test]
+    async fn default_send_speech_is_model_unavailable_and_object_safe() {
+        // Upstreams without a speech implementation decline the workload
+        // with ModelUnavailable naming the caller's model. The call goes
+        // through `Arc<dyn Upstream>` to prove the boxed-stream signature
+        // stays object-safe.
+        struct ChatOnly;
+
+        #[async_trait]
+        impl Upstream for ChatOnly {
+            async fn send(
+                &self,
+                _req: ChatRequest,
+                _upstream_model: &str,
+            ) -> Result<ChatResponse, ProtocolError> {
+                unreachable!("not under test")
+            }
+        }
+
+        let upstream: std::sync::Arc<dyn Upstream> = std::sync::Arc::new(ChatOnly);
+        match upstream
+            .send_speech(speech_request("local-chat"), "ignored-alias")
+            .await
+        {
+            Err(ProtocolError::ModelUnavailable(model)) => assert_eq!(model, "local-chat"),
+            Err(other) => panic!("expected ModelUnavailable, got {other:?}"),
+            Ok(_) => panic!("default must decline"),
+        }
+    }
+
+    /// A mock speech backend: answers with one audio chunk and no
+    /// `Content-Length` (so the body stays open until close), then reports
+    /// whether the client hung up.
+    fn serve_one_audio_chunk_then_watch() -> (String, JoinHandle<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock backend");
+        let addr = listener.local_addr().expect("addr");
+        let handle = thread::spawn(move || -> bool {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return false;
+            };
+            let mut buf = [0_u8; 4096];
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            // Chunked, so the body has no declared end and stays open.
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nTransfer-Encoding: chunked\r\n\r\n";
+            if stream
+                .write_all(head.as_bytes())
+                .and_then(|()| stream.write_all(b"4\r\nRIFF\r\n"))
+                .and_then(|()| stream.flush())
+                .is_err()
+            {
+                return false;
+            }
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => return true,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        return false;
+                    }
+                    Err(_) => return true,
+                }
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn dropping_the_audio_stream_aborts_the_upstream_connection() {
+        // Client-disconnect cancellation is Drop all the way down: dropping
+        // the audio stream drops the upstream response, which aborts the
+        // upstream connection and stops the backend synthesizing.
+        let (base, handle) = serve_one_audio_chunk_then_watch();
+        let upstream = OpenAiUpstream::new(&base, Secret::new(String::new()));
+        let mut audio = upstream
+            .send_speech(speech_request("m"), "u")
+            .await
+            .expect("stream opens");
+        let first = audio.body.next().await.expect("first chunk");
+        assert_eq!(&first.expect("chunk reads")[..], b"RIFF");
+        drop(audio);
+        let closed = tokio::task::spawn_blocking(move || handle.join().expect("join"))
+            .await
+            .expect("watch task");
+        assert!(
+            closed,
+            "dropping the audio stream must abort the upstream connection"
         );
     }
 

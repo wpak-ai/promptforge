@@ -48,6 +48,10 @@ pub(crate) enum GatewayError {
     #[error("audio file exceeds the 25 MiB limit")]
     AudioTooLarge,
 
+    /// A speech request named a voice its model does not offer.
+    #[error(transparent)]
+    Tts(#[from] gateway_tts::TtsError),
+
     /// The active STT engine rejected an otherwise valid request.
     #[cfg(feature = "stt")]
     #[non_exhaustive]
@@ -352,6 +356,11 @@ impl GatewayError {
                 "invalid_request_error",
                 "file_too_large",
             ),
+            GatewayError::Tts(_) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid_voice",
+            ),
             #[cfg(feature = "stt")]
             GatewayError::Transcription(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -553,6 +562,17 @@ mod tests {
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
                     "kind_mismatch",
+                ),
+            ),
+            (
+                GatewayError::from(
+                    gateway_tts::check_voice("orpheus", "nova", &["tara".to_owned()])
+                        .expect_err("an uncatalogued voice is refused"),
+                ),
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "invalid_voice",
                 ),
             ),
             (

@@ -518,14 +518,15 @@ impl fmt::Display for ToolDialect {
     }
 }
 
-/// The workload a model serves: chat completions, embeddings, or
-/// classification.
+/// The workload a model serves: chat completions, embeddings,
+/// classification, or speech synthesis.
 ///
 /// The kind scopes which configuration fields are meaningful: chat-only
 /// fields (for example `thinking`, `default_max_tokens`,
-/// `chat_template_file`) are rejected for non-chat kinds at validation,
-/// while `context` applies to every kind. The catalog carries the kind so
-/// clients can filter before building a request.
+/// `chat_template_file`) are rejected for non-chat kinds at validation, and
+/// `voices` is rejected for every kind but `speech`, while `context`
+/// applies to every kind. The catalog carries the kind so clients can
+/// filter before building a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
@@ -537,6 +538,9 @@ pub enum ModelKind {
     Embedding,
     /// Classification / reranking.
     Classifier,
+    /// Speech synthesis (`POST /v1/audio/speech`). Remote-only in this
+    /// release; a `[[local_model]]` declaring it is a validation error.
+    Speech,
 }
 
 impl fmt::Display for ModelKind {
@@ -545,6 +549,7 @@ impl fmt::Display for ModelKind {
             ModelKind::Chat => "chat",
             ModelKind::Embedding => "embedding",
             ModelKind::Classifier => "classifier",
+            ModelKind::Speech => "speech",
         };
         f.write_str(spelling)
     }
@@ -556,7 +561,8 @@ impl fmt::Display for ModelKind {
 /// reaches it. They are flattened into `[[model]]` and `[[local_model]]`,
 /// validated at load, and surfaced verbatim on `GET /v1/models` so clients
 /// can shape requests before sending them. The effort knobs are chat-only
-/// and require a `thinking` mode other than `never`.
+/// and require a `thinking` mode other than `never`; `voices` is
+/// speech-only.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Capabilities {
@@ -586,6 +592,11 @@ pub struct Capabilities {
     /// chat kind only. Defaults to false.
     #[serde(default)]
     adaptive_thinking: bool,
+    /// The named voices a speech model offers; speech kind only. Empty
+    /// means the model names no voices and the backend chooses, so the
+    /// gateway forwards whatever `voice` the caller asked for.
+    #[serde(default)]
+    voices: Vec<String>,
 }
 
 /// One model name and the backend it resolves to.

@@ -54,6 +54,10 @@ shared-progress = { workspace = true, features = ["serde"] }
 # Optional: gateway-hosted speech-to-text (engine lifecycle, the
 # `/v1/audio/transcriptions` route), behind the default-on `stt` feature.
 gateway-stt = { workspace = true, optional = true }
+# The speech service behind POST /v1/audio/speech. Not optional: it is a
+# remote passthrough with no native dependency, so a headless build serves
+# speech models too.
+gateway-tts.workspace = true
 gateway-web-search = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true

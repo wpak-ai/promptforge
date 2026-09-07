@@ -1,0 +1,32 @@
+[package]
+name = "gateway-tts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+description = "PromptForge gateway speech service: voice validation and the audio relay behind POST /v1/audio/speech"
+readme = "README.md"
+keywords = ["llm", "gateway", "openai", "proxy", "tts"]
+categories = ["web-programming::http-server"]
+documentation = "https://cppalliance.github.io/promptforge/"
+
+[dependencies]
+axum.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+shared-protocol.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio-util.workspace = true
+
+[lints]
+workspace = true

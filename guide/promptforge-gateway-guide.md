@@ -229,7 +229,7 @@ Every remote model must list at least one endpoint, and every endpoint it names 
 
 ## Kinds and thinking modes
 
-Every model carries a `kind`: `chat`, `embedding`, or `classifier`. The kind scopes which fields are meaningful. Chat-only fields such as `thinking` and `default_max_tokens` are rejected for non-chat kinds at load time.
+Every model carries a `kind`: `chat`, `embedding`, `classifier`, or `speech`. The kind scopes which fields are meaningful. Chat-only fields such as `thinking` and `default_max_tokens` are rejected for non-chat kinds at load time, and `voices` is accepted only for speech models.
 
 Record each chat model's thinking behavior as `never`, `always`, or `switchable`. Switchable means the client may toggle thinking per request.
 
@@ -258,9 +258,9 @@ default_effort = "medium"
 adaptive_thinking = true
 ````
 
-The capability fields are `max_output`, `default_temperature`, `images`, `parallel_tool_calls`, `effort_levels`, `default_effort`, and `adaptive_thinking`. They obey cross-field rules at load time. A `default_effort` without `effort_levels` fails. A `default_effort` not listed in `effort_levels` fails. Effort fields fail when thinking is `never`. A `max_output` larger than `context` fails; an exact fit passes.
+The capability fields are `max_output`, `default_temperature`, `images`, `parallel_tool_calls`, `effort_levels`, `default_effort`, `adaptive_thinking`, and `voices`. They obey cross-field rules at load time. A `default_effort` without `effort_levels` fails. A `default_effort` not listed in `effort_levels` fails. Effort fields fail when thinking is `never`. A `max_output` larger than `context` fails; an exact fit passes.
 
-Enumerated fields accept a fixed spelling vocabulary. Use the spellings verbatim: protocol `openai`; thinking `never`, `always`, or `switchable`; tool_dialect `openai` or `gemma3_tool_code`; model kind `chat`, `embedding`, or `classifier`.
+Enumerated fields accept a fixed spelling vocabulary. Use the spellings verbatim: protocol `openai`; thinking `never`, `always`, or `switchable`; tool_dialect `openai` or `gemma3_tool_code`; model kind `chat`, `embedding`, `classifier`, or `speech`.
 
 ## What the caller sees
 
@@ -272,7 +272,7 @@ curl -H "Authorization: Bearer $GATEWAY_KEY" http://127.0.0.1:8081/v1/models
 
 Each configured model carries its caller-facing id, its workload kind, its description, its context window size, its thinking mode, and its capability metadata.
 
-When a caller sends a chat, embedding, or rerank request, the gateway forwards it to the backend paths `chat/completions`, `embeddings`, or `rerank` relative to the configured base URL. The public model name is rewritten to the upstream alias. The caller's bearer token is never sent upstream.
+When a caller sends a chat, embedding, rerank, or speech request, the gateway forwards it to the backend paths `chat/completions`, `embeddings`, `rerank`, or `audio/speech` relative to the configured base URL. The public model name is rewritten to the upstream alias. The caller's bearer token is never sent upstream.
 
 ---
 
@@ -319,7 +319,7 @@ Local inference runs on a pinned llama-server build, b10082. The gateway prefers
 
 The gateway runs one managed llama-server child per configured `[[local_model]]`. Children get supervised respawn and deterministic teardown. Staged CUDA bundle directories are prepended to the child process's PATH only; the gateway's own environment is never mutated. Local models appear to clients as ordinary routed models under their configured names.
 
-A local model's `kind` selects the child's serving mode: embedding models serve embeddings, and classifier models serve reranking. The `parallel` key sets both the child's concurrency and its admission limit. The thinking setting changes the child's sampling preset: thinking models sample at temperature 1.0 and top-p 0.95, while non-thinking models run with reasoning switched off and sample at 0.7 and 0.8.
+A local model's `kind` selects the child's serving mode: embedding models serve embeddings, and classifier models serve reranking. A kind with no serving mode, such as `speech`, is refused at load rather than started as a chat child. The `parallel` key sets both the child's concurrency and its admission limit. The thinking setting changes the child's sampling preset: thinking models sample at temperature 1.0 and top-p 0.95, while non-thinking models run with reasoning switched off and sample at 0.7 and 0.8.
 
 ## Chat templates
 
@@ -445,6 +445,63 @@ The /stt socket refuses cross-site browser connections: the upgrade performs an 
 During a take the status bar shows "Listening...", then "Transcribing...", then "Finalizing transcript...", and failures appear as notices. A take that overruns the interim window without a final model is truncated; the warning names the window length and the dropped lead in seconds.
 
 Switching the active profile provisions and loads the selected speech models. Switching away unloads the engine and releases the model memory.
+
+---
+
+# Speech Synthesis
+
+This chapter teaches you the gateway's synthesis surface: how to declare a speech model, what the speech endpoint accepts, and how audio comes back. It builds on remote models, because a speech model is an ordinary remote catalog entry with a different kind.
+
+## Declare a speech model
+
+A speech model is a `[[model]]` entry with `kind = "speech"`:
+
+````
+[[endpoint]]
+id = "together"
+protocol = "openai"
+base_url = "https://api.together.xyz/v1"
+api_key = "${TOGETHER_API_KEY}"
+
+[[model]]
+name = "orpheus"
+kind = "speech"
+description = "Orpheus 3B conversational speech synthesis"
+context = 8192
+upstream = "canopylabs/orpheus-3b-0.1-ft"
+endpoints = ["together"]
+voices = ["tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"]
+````
+
+Everything a remote chat model carries applies here too: the entry resolves through the same routing table, admits through the same dominion queue, appears on GET /v1/models, and is enabled by profile membership. The chat-only fields are refused, the same way they are for embedding and classifier models.
+
+The `voices` list names the voices this model offers. A request naming a voice outside the list is refused before the backend is called, with a message listing the valid ones. Leave the list empty to disable the check and let the backend decide; an empty entry or a duplicate in the list fails startup, because both hide a typo behind a valid-looking catalog. Voice sets belong to a checkpoint rather than to speech in general, so each model carries its own.
+
+Local speech serving is not part of this release. A `[[local_model]]` declaring `kind = "speech"` fails startup with a message naming the remote alternative, rather than starting a child that would serve the wrong workload.
+
+## The speech endpoint
+
+The gateway serves OpenAI-compatible synthesis at POST /v1/audio/speech. The JSON body requires `model`, `input`, and `voice`, and accepts `response_format`, `speed`, `instructions`, and `stream_format`. Fields the gateway does not name pass through to the backend verbatim.
+
+The `input` text is capped at 4096 characters and reaches the backend exactly as written. Speech models take direction from tags written inline in the text, such as `<laugh>` and `<sigh>`, so nothing on this path escapes or strips them.
+
+The `response_format` chooses the container: `mp3` by default, plus `opus`, `aac`, `flac`, `wav`, and `pcm`. A caller who names none gets `mp3` written into the forwarded request rather than the backend's own default, because providers disagree about what that default is. An unrecognized format is refused rather than quietly replaced. The `speed` must fall between 0.25 and 4.0.
+
+Voice, format, and text are all checked before the request is admitted to a queue, so a malformed request never occupies a concurrency slot.
+
+## How audio comes back
+
+The response body is the backend's audio, byte for byte, under the backend's own content type. Nothing re-encodes or re-frames it. There is no `Content-Length`, because a clip's length is unknown when the headers go out; the body is chunked and ends by ending.
+
+That framing shapes how failures appear. The status and headers are sent before the first audio byte, so a synthesis that dies mid-clip cannot be reported as an error envelope: an error appended to half a clip would be indistinguishable from audio. The body ends early instead, which every HTTP client reports as a truncated download. A failure that happens before the first byte is still an ordinary JSON error.
+
+The queue slot is held for the whole clip, not just the request that started it, so a profile switch drains a synthesis in progress. Hanging up mid-clip aborts the upstream synthesis and releases the slot immediately; nothing keeps generating audio no one is listening to.
+
+Two upstream conditions are distinguishable by their error codes: `upstream_rate_limited` for a rate-limited provider and `upstream_unavailable` for one at capacity. A voice the model does not offer is `invalid_voice`.
+
+## The voice catalog
+
+GET /v1/audio/voices lists the union of every loaded speech model's voices, sorted and deduplicated, as objects with `id` and `name`. OpenAI has no such endpoint, but the OpenAI-compatible ecosystem converged on this route and clients probe for it, so the gateway serves it. The same voices also appear on each model's own GET /v1/models entry.
 
 ---
 
@@ -778,15 +835,15 @@ You can search Hugging Face and read model details and READMEs through the gatew
 
 ## Errors and limits
 
-Every request failure reaches the client in the OpenAI error envelope: an object with `message`, `type`, and `code` under `error`, with a stable HTTP status. Examples: 401 `unauthorized`, 404 `model_not_found`, 400 `malformed_request`, 400 `kind_mismatch`, 429 `queue_rejected`, 503 `queue_full`, 503 `profile_switch`, 503 `partial_start`, 422 `config_write_rejected`, and 422 `model_info_error`.
+Every request failure reaches the client in the OpenAI error envelope: an object with `message`, `type`, and `code` under `error`, with a stable HTTP status. Examples: 401 `unauthorized`, 404 `model_not_found`, 400 `malformed_request`, 400 `kind_mismatch`, 400 `invalid_voice`, 429 `queue_rejected`, 429 `upstream_rate_limited`, 503 `queue_full`, 503 `upstream_unavailable`, 503 `profile_switch`, 503 `partial_start`, 422 `config_write_rejected`, and 422 `model_info_error`.
 
-Outbound calls to any backend have fixed timeouts: 10 seconds to connect and 120 seconds for a whole non-streaming request. Streaming connections are bounded only by the connect timeout. Response bodies the gateway reads are capped: 64 KiB for error bodies and 4 MiB for success JSON bodies.
+Outbound calls to any backend have fixed timeouts: 10 seconds to connect and 120 seconds for a whole non-streaming request. Chat streams are bounded only by the connect timeout, since a long silence there is prompt processing. Speech synthesis adds a 60-second idle read timeout that resets on every chunk, so a steady clip streams as long as it needs while a dead backend cannot hold a queue slot open. Response bodies the gateway reads are capped: 64 KiB for error bodies and 4 MiB for success JSON bodies.
 
-Malformed client requests are rejected at the boundary. An empty model name, an empty messages array, an unsupported message role, or a message with neither content nor a tool call all fail validation. Request fields the gateway does not name pass through to the backend verbatim, while the reserved keys `model`, `messages`, and `stream` may not be smuggled in twice. Embeddings requests accept one string or a batch of strings, with an optional `encoding_format` of `float` or `base64`; an empty batch is rejected. Rerank requests carry a query, a document set, and an optional `top_n` limit; an empty query or document set is rejected.
+Malformed client requests are rejected at the boundary. An empty model name, an empty messages array, an unsupported message role, or a message with neither content nor a tool call all fail validation. Request fields the gateway does not name pass through to the backend verbatim, while the reserved keys `model`, `messages`, and `stream` may not be smuggled in twice. Embeddings requests accept one string or a batch of strings, with an optional `encoding_format` of `float` or `base64`; an empty batch is rejected. Rerank requests carry a query, a document set, and an optional `top_n` limit; an empty query or document set is rejected. Speech requests carry a model, the text to synthesize, and a voice; blank text, text past 4096 characters, a voice the model does not offer, an unrecognized `response_format`, and a `speed` outside 0.25 to 4.0 are all rejected before the request reaches a queue.
 
 ## Reading failures
 
-The error code distinguishes a connection that never reached the provider from a mid-flight failure. The first is safe to retry; nothing was billed. The second is not safe to retry blindly. A backend's own client-error status, for example 429, passes through to the caller with code `upstream_client_error` instead of a generic 502. A model of the wrong kind is refused with 400 `kind_mismatch` before any upstream call. A request for a workload the resolved model cannot serve is rejected with 400 `model_unavailable`.
+The error code distinguishes a connection that never reached the provider from a mid-flight failure. The first is safe to retry; nothing was billed. The second is not safe to retry blindly. A backend's own client-error status, for example 404, passes through to the caller with code `upstream_client_error` instead of a generic 502. Two backend statuses are named rather than pooled, because a caller acts on them differently: a rate-limited backend is 429 `upstream_rate_limited` and a backend at capacity is 503 `upstream_unavailable`. A model of the wrong kind is refused with 400 `kind_mismatch` before any upstream call. A request for a workload the resolved model cannot serve is rejected with 400 `model_unavailable`.
 
 When the gateway recovers from a malformed tool fence in an emulated tool dialect, the response message carries a `gateway_warning` extension field. The turn never fails, and protocol junk never appears as final text. Streaming clients still receive tool calls from an emulated-dialect model: the gateway buffers one upstream round trip and re-emits the rewritten response as synthetic chunks, with a trailing summary chunk carrying usage and timings.
 

@@ -78,7 +78,7 @@ test("the local detail pane renders the registry sections with the model's value
   assert.deepEqual(
     dropdownValues(root, "kind"),
     ["chat", "embedding", "classifier"],
-    "the header kind dropdown offers the three model kinds",
+    "a local entry omits speech, which the gateway cannot serve locally",
   );
   assert.equal(kindSelect.value, "chat");
 
@@ -322,6 +322,43 @@ test("the remote detail pane renders routing fields and effort levels feed defau
     ["", "low", "high", "medium"],
     "a new effort level immediately feeds the default-effort options",
   );
+});
+
+test("a remote model can be made a speech model and given voices", async () => {
+  const stub = fixtureStub();
+  const { dom, root } = await bootApp({ key: "k", stub });
+  navigate(dom, "#/remote/gpt-remote");
+  await settle();
+
+  assert.deepEqual(
+    dropdownValues(root, "kind"),
+    ["chat", "embedding", "classifier", "speech"],
+    "a remote entry can serve speech",
+  );
+  assert.equal(
+    root.querySelector(".field-row[data-key='voices']"),
+    null,
+    "voices stays hidden until the model serves speech",
+  );
+
+  root.querySelector(".field-row[data-key='kind'] .menu-item[data-value='speech']").click();
+  await settle();
+
+  const voicesRow = root.querySelector(".field-row[data-key='voices']");
+  assert.ok(voicesRow, "choosing speech reveals the voices field");
+  const chips = voicesRow.querySelector(".chip-input input");
+  chips.value = "tara";
+  chips.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Enter" }));
+  await settle();
+
+  root.querySelector(".detail-save").click();
+  await settle();
+  const put = stub.calls.find(
+    (call) => call.url.endsWith("/admin/config") && call.init.method === "PUT",
+  );
+  const model = JSON.parse(put.init.body).model.find((entry) => entry.name === "gpt-remote");
+  assert.equal(model.kind, "speech");
+  assert.deepEqual(model.voices, ["tara"], "the saved entry carries the voice list");
 });
 
 test("cache_type_v is disabled until flash attention turns on", async () => {

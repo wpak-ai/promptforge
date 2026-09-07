@@ -20,7 +20,7 @@ promptforge-gateway serve gateway.toml --profile main
 
 The config path comes from the positional argument or the `PROMPTFORGE_GATEWAY_CONFIG` environment variable (the CLI argument wins). With neither set, the gateway searches beside the executable, then the working directory, then the user profile's `.promptforge` directory; when no `gateway.toml` exists, first run writes a default there - loopback on an OS-assigned port, a fresh random bearer key, `trust_loopback = true` so same-machine callers need no key (with the shared-machine caveat and the `trust_loopback = false` opt-out noted in the file), the recommended STT pair unless the installer declined it - and boots from it. The profile comes from `--profile NAME`, the `PROMPTFORGE_PROFILE` environment variable, or the sibling state file, in that precedence; with none set, startup refuses and lists the profiles the config defines. The generated default writes its state file selecting `default`, so a bare first boot needs no flags.
 
-Configure endpoints, models, and credentials in the TOML catalog. The gateway accepts `POST /v1/chat/completions`, serves a model catalog at `GET /v1/models`, and, with the default-on `stt` feature, serves streaming dictation at `/stt`, capability discovery at `GET /stt/capability`, and OpenAI-compatible multipart transcription at `POST /v1/audio/transcriptions`.
+Configure endpoints, models, and credentials in the TOML catalog. The gateway accepts `POST /v1/chat/completions`, `POST /v1/embeddings`, and `POST /v1/rerank`, synthesizes speech at `POST /v1/audio/speech` with the voice catalog at `GET /v1/audio/voices`, serves a model catalog at `GET /v1/models`, and, with the default-on `stt` feature, serves streaming dictation at `/stt`, capability discovery at `GET /stt/capability`, and OpenAI-compatible multipart transcription at `POST /v1/audio/transcriptions`.
 
 Embedding hosts use the library API instead of the binary: `spawn` starts the gateway on a dedicated thread with its own runtime and blocks until the listener is bound, returning a `GatewayHandle` that carries the bound URL and a graceful-shutdown switch (`url()`, `shutdown()`, `join()`).
 
@@ -128,6 +128,38 @@ entries above; the active profile enables them by catalog name.
 | `window_seconds` | `15` | Seconds of trailing audio each interim pass transcribes. |
 | `interval_ms` | `500` | Milliseconds between interim passes while a take is recording. |
 | `vocabulary` | `[]` | Domain terms whisper is biased toward. Empty disables biasing. |
+
+### Speech synthesis models
+
+Speech models are ordinary catalog entries with `kind = "speech"`, routed like any other remote model: they resolve through the same routing table, admit through the same dominion queue, and appear on `GET /v1/models`. Local speech serving is not in this release, so a `[[local_model]]` declaring `kind = "speech"` is a startup error naming the remote alternative.
+
+```toml
+[[endpoint]]
+id = "together"
+protocol = "openai"
+base_url = "https://api.together.xyz/v1"
+api_key = "${TOGETHER_API_KEY}"
+
+[[model]]
+name = "orpheus"
+kind = "speech"
+description = "Orpheus 3B conversational speech synthesis"
+context = 8192
+upstream = "canopylabs/orpheus-3b-0.1-ft"
+endpoints = ["together"]
+voices = ["tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"]
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `kind` | `chat` | `speech` routes the model to `POST /v1/audio/speech`. |
+| `voices` | `[]` | Voice names this model offers. A request naming another voice is refused with `invalid_voice` listing these; an empty list disables the check and lets the backend decide. |
+
+`POST /v1/audio/speech` takes the OpenAI speech body: `model`, `input`, and `voice` are required, and `response_format` (`mp3` default, plus `opus`, `aac`, `flac`, `wav`, `pcm`), `speed` (0.25 to 4.0), `instructions`, and `stream_format` are optional. Unnamed fields pass through to the backend verbatim. `input` is capped at 4096 characters and is never rewritten on the way through: speech models take inline direction from bracketed tags such as `<laugh>` and `<sigh>`, which any escaping would destroy. A caller who names no `response_format` gets `mp3` pinned into the forwarded request rather than the backend's own default, since providers disagree about what that is.
+
+The response is the backend's audio, byte for byte, under the backend's own `Content-Type` and with no `Content-Length`: a synthesized clip has no known length when the headers go out. Because the status and headers are sent before the first audio byte, a synthesis that fails mid-clip cannot be reported as an error envelope; the body ends early instead, so a caller sees a truncated download rather than a short clip that looks complete. Hanging up mid-clip aborts the upstream synthesis and releases the queue slot.
+
+`GET /v1/audio/voices` lists the union of every loaded speech model's voices as `{"id", "name"}` objects. OpenAI has no such endpoint, but the OpenAI-compatible ecosystem converged on it and clients probe for it.
 
 ## Local model companions
 

@@ -644,7 +644,12 @@ export function createModelsView(deps: ModelsViewDeps): ModelsView {
           help: "The workload this model serves.",
           section: "header",
           type: "dropdown",
-          options: ["chat", "embedding", "classifier"],
+          // Speech is remote-only: the gateway has no local serving mode for
+          // it, so offering it on a local entry would only produce a config
+          // the gateway refuses to load.
+          options: entry.kind === "remote"
+            ? ["chat", "embedding", "classifier", "speech"]
+            : ["chat", "embedding", "classifier"],
           default: "chat",
         }),
       );

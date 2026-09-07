@@ -52,6 +52,15 @@ effort_levels = ["low", "high"]
 default_effort = "low"
 adaptive_thinking = true
 
+[[model]]
+name = "orpheus"
+kind = "speech"
+description = "a remote speech model"
+context = 8192
+upstream = "orpheus-x"
+endpoints = ["openai"]
+voices = ["tara", "leo"]
+
 [[local_model]]
 name = "gemma"
 kind = "chat"
@@ -111,7 +120,7 @@ vocabulary = ["MCP", "GGUF"]
 
 [[profile]]
 name = "work"
-models = ["gpt", "gemma", "whisper-base-en"]
+models = ["gpt", "orpheus", "gemma", "whisper-base-en"]
 "#;
 
 const MINIMAL: &str = r#"
@@ -212,6 +221,7 @@ fn enums_round_trip_with_their_toml_spellings() {
     check(ModelKind::Chat, "chat");
     check(ModelKind::Embedding, "embedding");
     check(ModelKind::Classifier, "classifier");
+    check(ModelKind::Speech, "speech");
     check(SttRole::Interim, "interim");
     check(SttRole::Final, "final");
 }
@@ -226,6 +236,7 @@ fn capabilities_round_trip_through_json() {
         effort_levels: vec!["low".to_owned(), "high".to_owned()],
         default_effort: Some("low".to_owned()),
         adaptive_thinking: true,
+        voices: vec!["tara".to_owned(), "leo".to_owned()],
     };
     let json = serde_json::to_value(&capabilities).expect("serializes");
     let back: Capabilities = serde_json::from_value(json).expect("deserializes");

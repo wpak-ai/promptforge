@@ -392,6 +392,19 @@ pub enum LocalError {
         source: serde_json::Error,
     },
 
+    /// A local model's kind has no `llama-server` serve mode.
+    ///
+    /// Configuration validation refuses such a model at load, so this is the
+    /// second line of defense: a kind added to `ModelKind` later cannot fall
+    /// through to the chat serve mode and quietly launch the wrong child.
+    #[error("local model {model} has kind {kind}, which has no llama-server serve mode")]
+    UnsupportedModelKind {
+        /// The affected model name.
+        model: String,
+        /// The kind with no serve mode.
+        kind: gateway_config::ModelKind,
+    },
+
     /// Resolving the tool dialect from `/props` evidence failed.
     #[error("dialect resolution failed for local model {model}")]
     DialectResolution {
@@ -480,6 +493,14 @@ mod tests {
             .is_retryable()
         );
         assert!(!LocalError::Capture { stream: "stdout" }.is_retryable());
+        // A kind with no serve mode never becomes serveable by waiting.
+        assert!(
+            !LocalError::UnsupportedModelKind {
+                model: "m".to_owned(),
+                kind: gateway_config::ModelKind::Speech,
+            }
+            .is_retryable()
+        );
     }
 
     #[test]

@@ -436,6 +436,188 @@ impl RerankResponse {
     }
 }
 
+/// The maximum number of characters `SpeechRequest::input` may carry.
+///
+/// Matches OpenAI's own cap. The binding constraint on a local engine is
+/// tokens rather than characters, so this is the wire contract, not an
+/// engine limit: splitting longer text belongs to the caller, and neither
+/// the route nor the engine silently truncates.
+pub const MAX_SPEECH_INPUT_CHARS: usize = 4096;
+
+/// The voice a speech request asks for.
+///
+/// OpenAI accepts both a plain name and an object naming a custom voice.
+/// The gateway validates a name against the model's catalogued `voices`, so
+/// only [`SpeechVoice::Name`] is served today; the object form stays
+/// representable rather than unparseable so a future custom-voice feature
+/// is an additive change and an object never deserializes as a name.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum SpeechVoice {
+    /// A named voice, matched against the model's catalogued voices.
+    Name(String),
+    /// A custom-voice object, passed through unread and refused at
+    /// validation.
+    Custom(Map<String, Value>),
+}
+
+impl SpeechVoice {
+    /// The voice name, or `None` for the custom-voice object form.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            SpeechVoice::Name(name) => Some(name),
+            SpeechVoice::Custom(_) => None,
+        }
+    }
+}
+
+/// The container a speech response is encoded in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum SpeechResponseFormat {
+    /// MPEG audio. The OpenAI default, and the gateway's.
+    #[default]
+    Mp3,
+    /// Opus in an Ogg container.
+    Opus,
+    /// Advanced Audio Coding.
+    Aac,
+    /// Free Lossless Audio Codec.
+    Flac,
+    /// RIFF WAVE.
+    Wav,
+    /// Headerless signed 16-bit little-endian PCM.
+    Pcm,
+}
+
+impl SpeechResponseFormat {
+    /// The media type this format is served as.
+    ///
+    /// Used only when the backend names no `Content-Type` of its own; a
+    /// backend that names one always wins, because it knows what it encoded.
+    #[must_use]
+    pub const fn content_type(self) -> &'static str {
+        match self {
+            SpeechResponseFormat::Mp3 => "audio/mpeg",
+            SpeechResponseFormat::Opus => "audio/ogg",
+            SpeechResponseFormat::Aac => "audio/aac",
+            SpeechResponseFormat::Flac => "audio/flac",
+            SpeechResponseFormat::Wav => "audio/wav",
+            SpeechResponseFormat::Pcm => "audio/pcm",
+        }
+    }
+}
+
+/// How a streaming speech response is framed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum SpeechStreamFormat {
+    /// Server-sent events carrying encoded audio chunks.
+    Sse,
+    /// A bare audio byte stream. OpenAI's default.
+    Audio,
+}
+
+/// An incoming speech synthesis request.
+///
+/// `input` is carried verbatim from the caller to the backend. Speech
+/// models take inline direction from bracketed tags (`<laugh>`, `<sigh>`),
+/// so nothing in this crate trims, escapes, or strips it: an
+/// HTML-escaping or tag-stripping reflex anywhere on this path silently
+/// destroys the feature.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct SpeechRequest {
+    /// The model name, resolved against the routing table.
+    pub model: String,
+    /// The text to synthesize, forwarded verbatim.
+    pub input: String,
+    /// The voice to synthesize with.
+    pub voice: SpeechVoice,
+    /// The container the audio comes back in. Always forwarded, so a caller
+    /// who names none gets this crate's default rather than the backend's
+    /// (providers disagree: OpenAI defaults to mp3, Together to wav).
+    #[serde(default)]
+    pub response_format: SpeechResponseFormat,
+    /// Playback rate between 0.25 and 4.0; absent means the backend's
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f32>,
+    /// Free-text style direction; absent means the backend's default. Not
+    /// every backend honors it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// How a streaming response is framed; absent means the backend's
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_format: Option<SpeechStreamFormat>,
+    /// Every field the gateway does not name, preserved verbatim.
+    #[serde(flatten)]
+    pub rest: Map<String, Value>,
+}
+
+impl SpeechRequest {
+    /// Reserved top-level keys that must never appear in the passthrough `rest`.
+    const RESERVED: [&'static str; 7] = [
+        "model",
+        "input",
+        "voice",
+        "response_format",
+        "speed",
+        "instructions",
+        "stream_format",
+    ];
+
+    /// The lowest playback rate a speech request may ask for.
+    const MIN_SPEED: f32 = 0.25;
+
+    /// The highest playback rate a speech request may ask for.
+    const MAX_SPEED: f32 = 4.0;
+
+    /// Validate the request shape at the trust boundary, without coercion.
+    ///
+    /// Rejects an empty model, blank or over-long `input`, a voice that is
+    /// not a non-empty name, an out-of-range `speed`, and any reserved key
+    /// smuggled into the flattened `rest` map (WIRE-001/003). The `input`
+    /// text itself is never rewritten - only measured - so inline direction
+    /// tags survive to the backend.
+    ///
+    /// # Errors
+    /// Returns a static reason string naming the first violated rule.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.model.trim().is_empty() {
+            return Err("model must not be empty");
+        }
+        if self.input.trim().is_empty() {
+            return Err("input must not be empty");
+        }
+        if self.input.chars().count() > MAX_SPEECH_INPUT_CHARS {
+            return Err("input must not exceed 4096 characters");
+        }
+        match self.voice.name() {
+            Some(name) if !name.trim().is_empty() => {}
+            Some(_) => return Err("voice must not be empty"),
+            None => return Err("voice must be a string; voice objects are not supported"),
+        }
+        if let Some(speed) = self.speed
+            && (!speed.is_finite() || !(Self::MIN_SPEED..=Self::MAX_SPEED).contains(&speed))
+        {
+            return Err("speed must be between 0.25 and 4.0");
+        }
+        if Self::RESERVED
+            .iter()
+            .any(|key| self.rest.contains_key(*key))
+        {
+            return Err(
+                "rest must not contain a reserved key (model, input, voice, response_format, speed, instructions, stream_format)",
+            );
+        }
+        Ok(())
+    }
+}
+
 /// The OpenAI-shaped model list returned by `GET /v1/models`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ModelsResponse {
@@ -452,7 +634,8 @@ pub struct ModelInfo {
     pub id: String,
     /// Always `"model"`.
     pub object: &'static str,
-    /// The workload this model serves (`"chat"`, `"embedding"`, `"classifier"`).
+    /// The workload this model serves (`"chat"`, `"embedding"`,
+    /// `"classifier"`, `"speech"`).
     pub kind: ModelKind,
     /// Prose describing the model for catalog consumers and semantic bind.
     pub description: String,
@@ -1005,6 +1188,187 @@ mod tests {
         assert!(resp.validate().is_err());
     }
 
+    fn speech_request(input: &str) -> SpeechRequest {
+        SpeechRequest {
+            model: "m".to_owned(),
+            input: input.to_owned(),
+            voice: SpeechVoice::Name("tara".to_owned()),
+            response_format: SpeechResponseFormat::default(),
+            speed: None,
+            instructions: None,
+            stream_format: None,
+            rest: Map::new(),
+        }
+    }
+
+    #[test]
+    fn speech_request_round_trips_and_pins_the_default_format() {
+        let json = serde_json::json!({
+            "model": "m",
+            "input": "hello there",
+            "voice": "tara",
+            "sample_rate": 24000,
+        });
+        let req: SpeechRequest = serde_json::from_value(json).expect("parse request");
+        assert_eq!(req.voice, SpeechVoice::Name("tara".to_owned()));
+        assert_eq!(req.response_format, SpeechResponseFormat::Mp3);
+        // Unnamed fields land in `rest`, not on named fields.
+        assert!(req.rest.contains_key("sample_rate"));
+        assert!(!req.rest.contains_key("model"));
+        assert!(!req.rest.contains_key("voice"));
+        let forwarded = serde_json::to_value(&req).expect("serialize");
+        // The caller named no format, so the forwarded body names ours: a
+        // backend defaulting to something else never decides for us.
+        assert_eq!(
+            forwarded.get("response_format").and_then(Value::as_str),
+            Some("mp3")
+        );
+        assert!(forwarded.get("speed").is_none(), "absent stays absent");
+        let reparsed: SpeechRequest = serde_json::from_value(forwarded).expect("reparse");
+        assert_eq!(req, reparsed);
+    }
+
+    #[test]
+    fn speech_request_preserves_inline_direction_tags_verbatim() {
+        // Speech models take direction from bracketed tags inline in the
+        // text. Escaping or stripping them silently destroys the feature, so
+        // the text must survive a round trip byte for byte.
+        let spoken = "Well <laugh> that is <sigh> fine & <gasp> \"quoted\"";
+        let req = speech_request(spoken);
+        assert!(req.validate().is_ok());
+        let forwarded = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(
+            forwarded.get("input").and_then(Value::as_str),
+            Some(spoken),
+            "inline direction tags must reach the backend unchanged"
+        );
+    }
+
+    /// Builds a request with one field mutated, for the validation table.
+    fn tweaked(mutate: impl FnOnce(&mut SpeechRequest)) -> SpeechRequest {
+        let mut req = speech_request("hello");
+        mutate(&mut req);
+        req
+    }
+
+    #[test]
+    fn speech_request_validation_table() {
+        let cases: Vec<(&str, SpeechRequest, bool)> = vec![
+            ("a plain request", speech_request("hello"), true),
+            ("blank input", speech_request("   "), false),
+            (
+                "an empty model",
+                tweaked(|r| r.model = "  ".to_owned()),
+                false,
+            ),
+            ("input at the cap", speech_request(&"a".repeat(4096)), true),
+            (
+                "input one over the cap",
+                speech_request(&"a".repeat(4097)),
+                false,
+            ),
+            (
+                // The cap counts characters, not bytes, so a multibyte text
+                // at the cap is accepted though its byte length is larger.
+                "multibyte input at the cap",
+                speech_request(&"e\u{301}".repeat(2048)),
+                true,
+            ),
+            (
+                "an empty voice",
+                tweaked(|r| r.voice = SpeechVoice::Name(" ".to_owned())),
+                false,
+            ),
+            (
+                "a custom-voice object",
+                tweaked(|r| r.voice = SpeechVoice::Custom(Map::new())),
+                false,
+            ),
+            ("the slowest speed", tweaked(|r| r.speed = Some(0.25)), true),
+            ("the fastest speed", tweaked(|r| r.speed = Some(4.0)), true),
+            (
+                "speed under the floor",
+                tweaked(|r| r.speed = Some(0.24)),
+                false,
+            ),
+            (
+                "speed over the ceiling",
+                tweaked(|r| r.speed = Some(4.01)),
+                false,
+            ),
+            (
+                "a non-finite speed",
+                tweaked(|r| r.speed = Some(f32::NAN)),
+                false,
+            ),
+            (
+                "a reserved key in rest",
+                tweaked(|r| {
+                    r.rest.insert("voice".to_owned(), serde_json::json!("leo"));
+                }),
+                false,
+            ),
+        ];
+        for (name, req, expected) in cases {
+            assert_eq!(req.validate().is_ok(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn speech_response_formats_map_to_their_media_types() {
+        for (format, spelling, content_type) in [
+            (SpeechResponseFormat::Mp3, "mp3", "audio/mpeg"),
+            (SpeechResponseFormat::Opus, "opus", "audio/ogg"),
+            (SpeechResponseFormat::Aac, "aac", "audio/aac"),
+            (SpeechResponseFormat::Flac, "flac", "audio/flac"),
+            (SpeechResponseFormat::Wav, "wav", "audio/wav"),
+            (SpeechResponseFormat::Pcm, "pcm", "audio/pcm"),
+        ] {
+            assert_eq!(format.content_type(), content_type);
+            let json = serde_json::to_value(format).expect("serialize");
+            assert_eq!(json, spelling);
+            let back: SpeechResponseFormat = serde_json::from_value(json).expect("deserialize");
+            assert_eq!(back, format);
+        }
+    }
+
+    #[test]
+    fn unknown_speech_spellings_are_refused_at_the_boundary() {
+        // An unknown format fails to deserialize rather than defaulting, so
+        // a caller never silently receives another encoding.
+        for body in [
+            serde_json::json!({
+                "model": "m", "input": "hi", "voice": "tara", "response_format": "raw",
+            }),
+            serde_json::json!({
+                "model": "m", "input": "hi", "voice": "tara", "response_format": "MP3",
+            }),
+            serde_json::json!({
+                "model": "m", "input": "hi", "voice": "tara", "stream_format": "chunked",
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<SpeechRequest>(body.clone()).is_err(),
+                "expected {body} to be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_voice_object_parses_as_the_custom_form() {
+        // The object form stays representable so a future custom-voice
+        // feature is additive; today validation refuses it.
+        let json = serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "voice": { "id": "voice_1234" },
+        });
+        let req: SpeechRequest = serde_json::from_value(json).expect("parse request");
+        assert!(matches!(req.voice, SpeechVoice::Custom(_)));
+        assert_eq!(req.voice.name(), None);
+        assert!(req.validate().is_err());
+    }
+
     #[test]
     fn model_info_serializes_kind_in_catalog_spelling() {
         let info = |kind: ModelKind| ModelInfo {
@@ -1020,6 +1384,7 @@ mod tests {
             (ModelKind::Chat, "chat"),
             (ModelKind::Embedding, "embedding"),
             (ModelKind::Classifier, "classifier"),
+            (ModelKind::Speech, "speech"),
         ] {
             let json = serde_json::to_value(info(kind)).expect("serialize");
             assert_eq!(json.get("kind").and_then(Value::as_str), Some(spelling));

@@ -874,7 +874,7 @@ impl ModelConfig {
     }
 
     /// Returns the workload this model serves: chat (the default),
-    /// embedding, or classifier.
+    /// embedding, classifier, or speech.
     ///
     /// # Examples
     /// ```
@@ -1215,7 +1215,7 @@ impl LocalModelConfig {
     }
 
     /// Returns the workload this model serves: chat (the default),
-    /// embedding, or classifier.
+    /// embedding, classifier, or speech.
     ///
     /// # Examples
     /// ```
@@ -1841,6 +1841,45 @@ impl Capabilities {
     #[must_use]
     pub fn effort_levels(&self) -> &[String] {
         &self.effort_levels
+    }
+
+    /// Returns the named voices a speech model offers (empty when the model
+    /// names none, leaving the choice to the backend).
+    ///
+    /// # Examples
+    /// ```
+    /// # use gateway_config::Config;
+    /// # let toml = r#"
+    /// # config-version = 2
+    /// # [server]
+    /// # bind = "127.0.0.1:8080"
+    /// # api_key = "secret"
+    /// #
+    /// # [[endpoint]]
+    /// # id = "e"
+    /// # protocol = "openai"
+    /// # base_url = "http://127.0.0.1:9"
+    /// # api_key = ""
+    /// #
+    /// # [[model]]
+    /// # name = "m"
+    /// # kind = "speech"
+    /// # description = "a speech model"
+    /// # context = 8192
+    /// # upstream = "u"
+    /// # endpoints = ["e"]
+    /// # voices = ["tara", "leo"]
+    /// # "#;
+    /// let config = Config::from_toml_str(toml)?;
+    /// assert_eq!(
+    ///     config.models()[0].capabilities().voices(),
+    ///     ["tara", "leo"]
+    /// );
+    /// # Ok::<(), gateway_config::ConfigError>(())
+    /// ```
+    #[must_use]
+    pub fn voices(&self) -> &[String] {
+        &self.voices
     }
 
     /// Returns the effort level applied when the caller omits one, when set.

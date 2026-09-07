@@ -152,6 +152,15 @@ function capabilities(): SettingDef[] {
       },
     },
     {
+      key: "voices",
+      label: "Voices",
+      help: "Voice names this speech model offers. A request naming another voice is refused; empty lets the backend choose.",
+      section: "capabilities",
+      type: "chips",
+      default: [],
+      visibleWhen: (ctx) => ctx.value("kind") === "speech",
+    },
+    {
       key: "adaptive_thinking",
       label: "Adaptive thinking",
       help: "Whether the model adaptively chooses how much to think per request.",

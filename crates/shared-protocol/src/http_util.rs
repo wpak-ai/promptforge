@@ -43,6 +43,34 @@ pub fn streaming_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// Idle read timeout for the speech path: the longest gap tolerated between
+/// two reads of one synthesis, not a deadline on the whole clip.
+const SPEECH_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// TCP keepalive for the speech path, so a peer that vanishes without a FIN
+/// cannot hold the connection - and the dominion permit behind it - open.
+const SPEECH_KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// Build a reqwest client for audio synthesis: a connect timeout, an idle
+/// read timeout, and TCP keepalive.
+///
+/// Unlike [`streaming_client`], this bounds silence. `read_timeout` is
+/// per-read and resets on every chunk, so a synthesis that streams steadily
+/// is never cut off, while a dead upstream fails instead of pinning a
+/// dominion permit forever. It is deliberately not applied to
+/// [`streaming_client`]: that timeout also bounds the wait for response
+/// headers, which on a chat stream is prompt-processing time and can
+/// legitimately exceed any idle bound.
+#[must_use]
+pub fn speech_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(SPEECH_READ_TIMEOUT)
+        .tcp_keepalive(SPEECH_KEEPALIVE)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Read at most `cap` bytes from `response`, stopping early once the cap is hit.
 ///
 /// The body is streamed chunk by chunk so an oversized or stalled response never

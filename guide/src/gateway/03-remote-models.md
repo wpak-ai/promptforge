@@ -37,7 +37,7 @@ Every remote model must list at least one endpoint, and every endpoint it names 
 
 ## Kinds and thinking modes
 
-Every model carries a `kind`: `chat`, `embedding`, or `classifier`. The kind scopes which fields are meaningful. Chat-only fields such as `thinking` and `default_max_tokens` are rejected for non-chat kinds at load time.
+Every model carries a `kind`: `chat`, `embedding`, `classifier`, or `speech`. The kind scopes which fields are meaningful. Chat-only fields such as `thinking` and `default_max_tokens` are rejected for non-chat kinds at load time, and `voices` is accepted only for speech models.
 
 Record each chat model's thinking behavior as `never`, `always`, or `switchable`. Switchable means the client may toggle thinking per request.
 
@@ -66,9 +66,9 @@ default_effort = "medium"
 adaptive_thinking = true
 ````
 
-The capability fields are `max_output`, `default_temperature`, `images`, `parallel_tool_calls`, `effort_levels`, `default_effort`, and `adaptive_thinking`. They obey cross-field rules at load time. A `default_effort` without `effort_levels` fails. A `default_effort` not listed in `effort_levels` fails. Effort fields fail when thinking is `never`. A `max_output` larger than `context` fails; an exact fit passes.
+The capability fields are `max_output`, `default_temperature`, `images`, `parallel_tool_calls`, `effort_levels`, `default_effort`, `adaptive_thinking`, and `voices`. They obey cross-field rules at load time. A `default_effort` without `effort_levels` fails. A `default_effort` not listed in `effort_levels` fails. Effort fields fail when thinking is `never`. A `max_output` larger than `context` fails; an exact fit passes.
 
-Enumerated fields accept a fixed spelling vocabulary. Use the spellings verbatim: protocol `openai`; thinking `never`, `always`, or `switchable`; tool_dialect `openai` or `gemma3_tool_code`; model kind `chat`, `embedding`, or `classifier`.
+Enumerated fields accept a fixed spelling vocabulary. Use the spellings verbatim: protocol `openai`; thinking `never`, `always`, or `switchable`; tool_dialect `openai` or `gemma3_tool_code`; model kind `chat`, `embedding`, `classifier`, or `speech`.
 
 ## What the caller sees
 
@@ -80,5 +80,5 @@ curl -H "Authorization: Bearer $GATEWAY_KEY" http://127.0.0.1:8081/v1/models
 
 Each configured model carries its caller-facing id, its workload kind, its description, its context window size, its thinking mode, and its capability metadata.
 
-When a caller sends a chat, embedding, or rerank request, the gateway forwards it to the backend paths `chat/completions`, `embeddings`, or `rerank` relative to the configured base URL. The public model name is rewritten to the upstream alias. The caller's bearer token is never sent upstream.
+When a caller sends a chat, embedding, rerank, or speech request, the gateway forwards it to the backend paths `chat/completions`, `embeddings`, `rerank`, or `audio/speech` relative to the configured base URL. The public model name is rewritten to the upstream alias. The caller's bearer token is never sent upstream.
 

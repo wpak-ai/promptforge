@@ -90,6 +90,16 @@ vram_gb = 24
 # default_effort = "medium"
 # adaptive_thinking = false
 
+# Optional remote speech model. Speech is remote-only in this release.
+# [[model]]
+# name = "orpheus"
+# kind = "speech"
+# description = "Conversational speech synthesis"
+# context = 8192
+# upstream = "canopylabs/orpheus-3b-0.1-ft"
+# endpoints = ["openai"]
+# voices = ["tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"]
+
 # Local chat model served by a managed llama-server child.
 [[local_model]]
 name = "qwen-local"
